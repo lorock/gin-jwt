@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"time"
@@ -15,6 +16,13 @@ func helloHandler(c *gin.Context) {
 		"userID": claims["id"],
 		"text":   "Hello World.",
 	})
+}
+
+// User demo
+type User struct {
+	UserName  string
+	FirstName string
+	LastName  string
 }
 
 func main() {
@@ -33,15 +41,19 @@ func main() {
 		Key:        []byte("secret key"),
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if (userId == "admin" && password == "admin") || (userId == "test" && password == "test") {
-				return userId, true
+				return &User{
+					UserName:  userId,
+					LastName:  "Bo-Yi",
+					FirstName: "Wu",
+				}, true
 			}
 
-			return userId, false
+			return nil, false
 		},
-		Authorizator: func(userId string, c *gin.Context) bool {
-			if userId == "admin" {
+		Authorizator: func(user interface{}, c *gin.Context) bool {
+			if v, ok := user.(string); ok && v == "admin" {
 				return true
 			}
 
@@ -60,7 +72,7 @@ func main() {
 		// - "header:<name>"
 		// - "query:<name>"
 		// - "cookie:<name>"
-		TokenLookup: "header:Authorization",
+		TokenLookup: "header: Authorization, query: token, cookie: jwt",
 		// TokenLookup: "query:token",
 		// TokenLookup: "cookie:token",
 
@@ -80,5 +92,7 @@ func main() {
 		auth.GET("/refresh_token", authMiddleware.RefreshHandler)
 	}
 
-	http.ListenAndServe(":"+port, r)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		log.Fatal(err)
+	}
 }

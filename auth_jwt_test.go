@@ -3,14 +3,15 @@ package jwt
 import (
 	"errors"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/buger/jsonparser"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/tidwall/gjson"
 	"gopkg.in/appleboy/gofight.v2"
 	"gopkg.in/dgrijalva/jwt-go.v3"
 )
@@ -47,7 +48,7 @@ func TestMissingRealm(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
@@ -68,7 +69,7 @@ func TestMissingKey(t *testing.T) {
 		Realm:      "test zone",
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
@@ -135,7 +136,7 @@ func TestMissingTimeOut(t *testing.T) {
 	authMiddleware := &GinJWTMiddleware{
 		Realm: "test zone",
 		Key:   key,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
@@ -154,7 +155,7 @@ func TestMissingTokenLookup(t *testing.T) {
 	authMiddleware := &GinJWTMiddleware{
 		Realm: "test zone",
 		Key:   key,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
@@ -170,7 +171,8 @@ func TestMissingTokenLookup(t *testing.T) {
 
 func helloHandler(c *gin.Context) {
 	c.JSON(200, gin.H{
-		"text": "Hello World.",
+		"text":  "Hello World.",
+		"token": GetToken(c),
 	})
 }
 
@@ -200,11 +202,9 @@ func TestInternalServerError(t *testing.T) {
 
 	r.GET("/auth/hello").
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
+			message := gjson.Get(r.Body.String(), "message")
 
-			message, _ := jsonparser.GetString(data, "message")
-
-			assert.Equal(t, ErrMissingRealm.Error(), message)
+			assert.Equal(t, ErrMissingRealm.Error(), message.String())
 			assert.Equal(t, http.StatusInternalServerError, r.Code)
 		})
 }
@@ -228,10 +228,9 @@ func TestErrMissingSecretKeyForLoginHandler(t *testing.T) {
 			"password": "admin",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
-			message, _ := jsonparser.GetString(data, "message")
+			message := gjson.Get(r.Body.String(), "message")
 
-			assert.Equal(t, ErrMissingSecretKey.Error(), message)
+			assert.Equal(t, ErrMissingSecretKey.Error(), message.String())
 			assert.Equal(t, http.StatusInternalServerError, r.Code)
 		})
 }
@@ -254,10 +253,9 @@ func TestMissingAuthenticatorForLoginHandler(t *testing.T) {
 			"password": "admin",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
-			message, _ := jsonparser.GetString(data, "message")
+			message := gjson.Get(r.Body.String(), "message")
 
-			assert.Equal(t, ErrMissingAuthenticatorFunc.Error(), message)
+			assert.Equal(t, ErrMissingAuthenticatorFunc.Error(), message.String())
 			assert.Equal(t, http.StatusInternalServerError, r.Code)
 		})
 }
@@ -268,20 +266,35 @@ func TestLoginHandler(t *testing.T) {
 	authMiddleware := &GinJWTMiddleware{
 		Realm: "test zone",
 		Key:   key,
-		PayloadFunc: func(userId string) map[string]interface{} {
+		PayloadFunc: func(userId interface{}) MapClaims {
 			// Set custom claim, to be checked in Authorizator method
-			return map[string]interface{}{"testkey": "testval", "exp": 0}
+			return MapClaims{"testkey": "testval", "exp": 0}
 		},
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
 
 			return "", false
 		},
-		Authorizator: func(userId string, c *gin.Context) bool {
+		Authorizator: func(user interface{}, c *gin.Context) bool {
 			return true
 		},
+		LoginResponse: func(c *gin.Context, code int, token string, t time.Time) {
+			cookie, err := c.Cookie("JWTToken")
+			if err != nil {
+				log.Println(err)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"code":    http.StatusOK,
+				"token":   token,
+				"expire":  t.Format(time.RFC3339),
+				"message": "login successfully",
+				"cookie":  cookie,
+			})
+		},
+		SendCookie: true,
 	}
 
 	handler := ginHandler(authMiddleware)
@@ -293,11 +306,9 @@ func TestLoginHandler(t *testing.T) {
 			"username": "admin",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
+			message := gjson.Get(r.Body.String(), "message")
 
-			message, _ := jsonparser.GetString(data, "message")
-
-			assert.Equal(t, ErrMissingLoginValues.Error(), message)
+			assert.Equal(t, ErrMissingLoginValues.Error(), message.String())
 			assert.Equal(t, http.StatusBadRequest, r.Code)
 			assert.Equal(t, "application/json; charset=utf-8", r.HeaderMap.Get("Content-Type"))
 		})
@@ -308,21 +319,25 @@ func TestLoginHandler(t *testing.T) {
 			"password": "test",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
-
-			message, _ := jsonparser.GetString(data, "message")
-
-			assert.Equal(t, ErrFailedAuthentication.Error(), message)
+			message := gjson.Get(r.Body.String(), "message")
+			assert.Equal(t, ErrFailedAuthentication.Error(), message.String())
 			assert.Equal(t, http.StatusUnauthorized, r.Code)
 		})
 
 	r.POST("/login").
+		SetCookie(gofight.H{
+			"JWTToken": "JWTToken",
+		}).
 		SetJSON(gofight.D{
 			"username": "admin",
 			"password": "admin",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
+			message := gjson.Get(r.Body.String(), "message")
+			cookie := gjson.Get(r.Body.String(), "cookie")
+			assert.Equal(t, "login successfully", message.String())
 			assert.Equal(t, http.StatusOK, r.Code)
+			assert.Equal(t, "JWTToken", cookie.String())
 		})
 }
 
@@ -346,7 +361,7 @@ func TestParseToken(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -402,7 +417,7 @@ func TestParseTokenRS256(t *testing.T) {
 		SigningAlgorithm: "RS256",
 		PrivKeyFile:      "testdata/jwtRS256.key",
 		PubKeyFile:       "testdata/jwtRS256.key.pub",
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -458,12 +473,27 @@ func TestRefreshHandlerRS256(t *testing.T) {
 		SigningAlgorithm: "RS256",
 		PrivKeyFile:      "testdata/jwtRS256.key",
 		PubKeyFile:       "testdata/jwtRS256.key.pub",
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		SendCookie:       true,
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
 
 			return userId, false
+		},
+		RefreshResponse: func(c *gin.Context, code int, token string, t time.Time) {
+			cookie, err := c.Cookie("JWTToken")
+			if err != nil {
+				log.Println(err)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"code":    http.StatusOK,
+				"token":   token,
+				"expire":  t.Format(time.RFC3339),
+				"message": "refresh successfully",
+				"cookie":  cookie,
+			})
 		},
 	}
 
@@ -497,8 +527,15 @@ func TestRefreshHandlerRS256(t *testing.T) {
 		SetHeader(gofight.H{
 			"Authorization": "Bearer " + makeTokenString("RS256", "admin"),
 		}).
+		SetCookie(gofight.H{
+			"JWTToken": makeTokenString("RS256", "admin"),
+		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
+			message := gjson.Get(r.Body.String(), "message")
+			cookie := gjson.Get(r.Body.String(), "cookie")
+			assert.Equal(t, "refresh successfully", message.String())
 			assert.Equal(t, http.StatusOK, r.Code)
+			assert.Equal(t, makeTokenString("RS256", "admin"), cookie.String())
 		})
 }
 
@@ -509,7 +546,7 @@ func TestRefreshHandler(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -553,7 +590,7 @@ func TestExpiredTokenOnRefreshHandler(t *testing.T) {
 		Realm:   "test zone",
 		Key:     key,
 		Timeout: time.Hour,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -589,14 +626,14 @@ func TestAuthorizator(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
 			return userId, false
 		},
-		Authorizator: func(userId string, c *gin.Context) bool {
-			if userId != "admin" {
+		Authorizator: func(user interface{}, c *gin.Context) bool {
+			if user.(string) != "admin" {
 				return false
 			}
 
@@ -632,36 +669,42 @@ func TestClaimsDuringAuthorization(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		PayloadFunc: func(userId string) map[string]interface{} {
+		PayloadFunc: func(data interface{}) MapClaims {
 			var testkey string
-			switch userId {
-			case "admin":
+			switch data {
+			case "Administrator":
 				testkey = "1234"
-			case "test":
+			case "User":
 				testkey = "5678"
+			case "Guest":
+				testkey = ""
 			}
 			// Set custom claim, to be checked in Authorizator method
-			return map[string]interface{}{"testkey": testkey, "exp": 0}
+			return MapClaims{"testkey": testkey, "exp": 0}
 		},
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
-				return "", true
-			}
-
-			if userId == "test" && password == "test" {
 				return "Administrator", true
 			}
 
-			return userId, false
+			if userId == "test" && password == "test" {
+				return "User", true
+			}
+
+			return "Guest", false
 		},
-		Authorizator: func(userId string, c *gin.Context) bool {
+		Authorizator: func(user interface{}, c *gin.Context) bool {
 			jwtClaims := ExtractClaims(c)
+
+			if jwtClaims["id"] == "administrator" {
+				return true
+			}
 
 			if jwtClaims["testkey"] == "1234" && jwtClaims["id"] == "admin" {
 				return true
 			}
 
-			if jwtClaims["testkey"] == "5678" && jwtClaims["id"] == "Administrator" {
+			if jwtClaims["testkey"] == "5678" && jwtClaims["id"] == "test" {
 				return true
 			}
 
@@ -672,7 +715,7 @@ func TestClaimsDuringAuthorization(t *testing.T) {
 	r := gofight.New()
 	handler := ginHandler(authMiddleware)
 
-	userToken, _, _ := authMiddleware.TokenGenerator("admin")
+	userToken, _, _ := authMiddleware.TokenGenerator("administrator", MapClaims{})
 
 	r.GET("/auth/hello").
 		SetHeader(gofight.H{
@@ -688,10 +731,8 @@ func TestClaimsDuringAuthorization(t *testing.T) {
 			"password": "admin",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
-
-			token, _ := jsonparser.GetString(data, "token")
-			userToken = token
+			token := gjson.Get(r.Body.String(), "token")
+			userToken = token.String()
 			assert.Equal(t, http.StatusOK, r.Code)
 		})
 
@@ -709,10 +750,8 @@ func TestClaimsDuringAuthorization(t *testing.T) {
 			"password": "test",
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
-			data := []byte(r.Body.String())
-
-			token, _ := jsonparser.GetString(data, "token")
-			userToken = token
+			token := gjson.Get(r.Body.String(), "token")
+			userToken = token.String()
 			assert.Equal(t, http.StatusOK, r.Code)
 		})
 
@@ -727,7 +766,7 @@ func TestClaimsDuringAuthorization(t *testing.T) {
 
 func TestEmptyClaims(t *testing.T) {
 
-	var jwtClaims map[string]interface{}
+	var jwtClaims jwt.MapClaims
 
 	// the middleware to test
 	authMiddleware := &GinJWTMiddleware{
@@ -735,7 +774,7 @@ func TestEmptyClaims(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
@@ -773,7 +812,7 @@ func TestUnauthorized(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -804,7 +843,7 @@ func TestTokenExpire(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: -time.Second,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -819,7 +858,7 @@ func TestTokenExpire(t *testing.T) {
 
 	r := gofight.New()
 
-	userToken, _, _ := authMiddleware.TokenGenerator("admin")
+	userToken, _, _ := authMiddleware.TokenGenerator("admin", MapClaims{})
 
 	r.GET("/auth/refresh_token").
 		SetHeader(gofight.H{
@@ -836,7 +875,7 @@ func TestTokenFromQueryString(t *testing.T) {
 		Realm:   "test zone",
 		Key:     key,
 		Timeout: time.Hour,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -852,7 +891,7 @@ func TestTokenFromQueryString(t *testing.T) {
 
 	r := gofight.New()
 
-	userToken, _, _ := authMiddleware.TokenGenerator("admin")
+	userToken, _, _ := authMiddleware.TokenGenerator("admin", MapClaims{})
 
 	r.GET("/auth/refresh_token").
 		SetHeader(gofight.H{
@@ -877,7 +916,7 @@ func TestTokenFromCookieString(t *testing.T) {
 		Realm:   "test zone",
 		Key:     key,
 		Timeout: time.Hour,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -893,7 +932,7 @@ func TestTokenFromCookieString(t *testing.T) {
 
 	r := gofight.New()
 
-	userToken, _, _ := authMiddleware.TokenGenerator("admin")
+	userToken, _, _ := authMiddleware.TokenGenerator("admin", MapClaims{})
 
 	r.GET("/auth/refresh_token").
 		SetHeader(gofight.H{
@@ -903,12 +942,32 @@ func TestTokenFromCookieString(t *testing.T) {
 			assert.Equal(t, http.StatusUnauthorized, r.Code)
 		})
 
+	r.GET("/auth/hello").
+		SetHeader(gofight.H{
+			"Authorization": "Bearer " + userToken,
+		}).
+		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
+			token := gjson.Get(r.Body.String(), "token")
+			assert.Equal(t, http.StatusUnauthorized, r.Code)
+			assert.Equal(t, "", token.String())
+		})
+
 	r.GET("/auth/refresh_token").
 		SetCookie(gofight.H{
 			"token": userToken,
 		}).
 		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
 			assert.Equal(t, http.StatusOK, r.Code)
+		})
+
+	r.GET("/auth/hello").
+		SetCookie(gofight.H{
+			"token": userToken,
+		}).
+		Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
+			token := gjson.Get(r.Body.String(), "token")
+			assert.Equal(t, http.StatusOK, r.Code)
+			assert.Equal(t, userToken, token.String())
 		})
 }
 
@@ -919,7 +978,7 @@ func TestDefineTokenHeadName(t *testing.T) {
 		Key:           key,
 		Timeout:       time.Hour,
 		TokenHeadName: "JWTTOKEN       ",
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return userId, true
 			}
@@ -957,7 +1016,7 @@ func TestHTTPStatusMessageFunc(t *testing.T) {
 		Key:        key,
 		Timeout:    time.Hour,
 		MaxRefresh: time.Hour * 24,
-		Authenticator: func(userId string, password string, c *gin.Context) (string, bool) {
+		Authenticator: func(userId string, password string, c *gin.Context) (interface{}, bool) {
 			if userId == "admin" && password == "admin" {
 				return "", true
 			}
